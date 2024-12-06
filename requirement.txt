@@ -1,0 +1,6 @@
+boto3
+langchain
+aws
+streamlit
+pillow
+requests requests-aws4auth elasticsearch

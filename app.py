@@ -1,85 +1,170 @@
 import base64
 import io
-import boto3
 import streamlit as st
+import time
 from PIL import Image
-import os
+import boto3
 import json
-
-# AWS SDK Client Setup
-bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")  # Sửa lại region nếu cần
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  #Path to Tesseract OCR executable
 
 # Constants
 ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png"]
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-KNOWLEDGE_BASE_ID = "QSDX9TVNUP"
+KNOWLEDGE_BASE_ID = "VIBMDAEXUG"
 MODEL_ARN = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0" 
 
-# Streamlit Page Setup
+# AWS Bedrock Client
+bedrock_client = boto3.client("bedrock-runtime")
+bedrock_agent_client = boto3.client("bedrock-agent-runtime")
+
+# Configure the Streamlit page settings
 st.set_page_config(
     layout="wide",
     page_title="Transaction Assistance Chatbot",
     page_icon="💳"
 )
 
-def image_to_base64(image):
-    """Chuyển đổi ảnh thành base64."""
-    buffered = io.BytesIO()  # Đảm bảo đã import io
-    image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return img_str
+def add_custom_css():
+    """Add custom CSS to improve the UI."""
+    st.markdown("""<style>
+        .main { padding: 2rem; }
+        .stButton>button { width: 100%; }
+        .upload-text { text-align: center; padding: 2rem; border: 2px dashed #cccccc; border-radius: 5px; }
+        .success-text { color: #0c5460; background-color: #d1ecf1; border-color: #bee5eb; padding: 1rem; border-radius: 5px; margin: 1rem 0; }
+        .error-text { color: #721c24; background-color: #f8d7da; border-color: #f5c6cb; padding: 1rem; border-radius: 5px; margin: 1rem 0; }
+        </style>""", unsafe_allow_html=True)
 
-def process_image_and_text(image, user_text):
-    """Xử lý hình ảnh và văn bản người dùng, gửi yêu cầu tới AWS Bedrock."""
-    # Chuyển hình ảnh thành base64
-    img_base64 = image_to_base64(image)
+def validate_image(uploaded_file) -> tuple[bool, str]:
+    """Validate the uploaded image file."""
+    if uploaded_file is None:
+        return False, "No file uploaded"
+    file_extension = uploaded_file.name.split(".")[-1].lower()
+    if file_extension not in ALLOWED_EXTENSIONS:
+        return False, f"Invalid file type. Please upload {', '.join(ALLOWED_EXTENSIONS)} files"
+    
+    if uploaded_file.size > MAX_IMAGE_SIZE:
+        return False, f"File too large. Maximum size is {MAX_IMAGE_SIZE / 1024 / 1024}MB"
+    
+    return True, ""
 
-    # Tạo payload cho Bedrock với hình ảnh base64 và văn bản người dùng
+def extract_text_from_image(image_file):
+    """Function to extract text from an uploaded image using Tesseract OCR."""
+    try:
+        # Load image as a PIL image
+        image = Image.open(image_file)
+        
+        # Use Tesseract to extract text from image
+        extracted_text = pytesseract.image_to_string(image)
+
+        if not extracted_text.strip():
+            st.error("Cannot extract text from image.")
+            return None
+        return extracted_text
+    except Exception as e:
+        st.error(f"Error processing the image: {str(e)}")
+        return None
+
+def retrieve_and_generate(user_request, extracted_text=None, kb_id=KNOWLEDGE_BASE_ID):
+    """Query the Knowledge Base via AWS Bedrock API."""
+    # Tạo đầu vào cho API, kết hợp text từ input người dùng và OCR
+    combined_input = user_request if user_request else ""
+    if extracted_text:
+        combined_input += f"\nExtracted Text: {extracted_text}"  # Thêm văn bản từ OCR (nếu có)
+
+    # Prepare the payload for Retrieve and Generate API
     payload = {
-        "modelArn": MODEL_ARN,
-        "inputs": [
-            {
-                "name": "image",
-                "value": img_base64
-            },
-            {
-                "name": "user_input",
-                "value": user_text
-            }
-        ]
+        "text": combined_input,  # Chỉ cần truyền text vào
     }
 
-    # Gửi yêu cầu tới Bedrock và nhận kết quả
-    response = bedrock_client.invoke_model(**payload)
+    # Gọi API Retrieve and Generate
+    try:
+        response = bedrock_agent_client.retrieve_and_generate(
+            input=payload,
+            retrieveAndGenerateConfiguration={
+                "type": "KNOWLEDGE_BASE",
+                "knowledgeBaseConfiguration": {
+                    "knowledgeBaseId": kb_id,
+                    "modelArn": MODEL_ARN
+                }
+            }
+        )
 
-    # Xử lý dữ liệu trả về từ Bedrock (giả sử đây là văn bản đã được xử lý)
-    if 'body' in response:
-        result = json.loads(response['body'].read().decode('utf-8'))
-        return result.get("response_text", "Không có kết quả")
-    return "Lỗi khi nhận kết quả từ Bedrock"
+        # Phân tích kết quả trả về
+        output = response["output"]["text"]
+        citations = response.get("citations", [])
+        retrieved_references = [
+            ref["retrievedReferences"] for ref in citations if "retrievedReferences" in ref
+        ]
+        return output, retrieved_references
 
-def submit_callback(image, user_text):
-    """Hàm xử lý khi người dùng nhấn nút submit."""
-    extracted_text = process_image_and_text(image, user_text)
-    st.write(f"Thông tin truy vấn từ Bedrock: {extracted_text}")
-    
-    # Ở đây bạn có thể truy vấn vào Knowledge Base (ví dụ OpenSearch)
-    # và trả về kết quả truy vấn cho người dùng
+    except Exception as e:
+        st.error(f"Error calling Retrieve and Generate API: {str(e)}")
+        return None, None
 
 def main():
-    """Chạy ứng dụng Streamlit."""
-    st.title("OCR và Truy Vấn Knowledge Base")
-    
-    # Upload hình ảnh từ người dùng
-    uploaded_image = st.file_uploader("Tải lên hình ảnh (JPEG, PNG, JPG)", type=ALLOWED_EXTENSIONS)
-    user_input = st.text_input("Nhập văn bản mô tả của bạn")
-    
-    if uploaded_image is not None and user_input:
-        image = Image.open(uploaded_image)
-        
-        # Thêm nút submit để thực hiện xử lý khi nhấn
-        if st.button("Submit"):
-            submit_callback(image, user_input)
+    """Main function to run the app."""
+    st.title("Transaction Assistance Chatbot")
+
+    # # File upload section
+    # uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+    # user_input = st.text_area("Enter your query:")
+
+    # # Validate file if uploaded
+    # if uploaded_file is not None:
+    #     is_valid, error_message = validate_image(uploaded_file)
+    #     if not is_valid:
+    #         st.error(error_message)
+    #     else:
+    #         extracted_text = extract_text_from_image(uploaded_file)        
+    #         if extracted_text:
+    #             st.success("Text extracted from image successfully.")
+    #             st.text_area("Extracted Text", extracted_text)
+
+    # # Query button
+    # if st.button("Submit"):
+    #     if not user_input and not extracted_text:
+    #         st.error("Please provide either a query or an image.")
+    #     else:
+    #         # Gọi hàm retrieve_and_generate, nếu không có ảnh thì chỉ gửi user_input
+    #         response, references = retrieve_and_generate(user_input or None, extracted_text or None)
+    #         if response:
+    #             st.write("Response: ", response)
+    #             if references:
+    #                 st.write("References: ", references)
+
+  
+
+    # File upload section
+    uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+    user_input = st.text_area("Enter your query:")
+
+    # Khởi tạo extracted_text là None trước
+    extracted_text = None
+
+    # Validate file if uploaded
+    if uploaded_file is not None:
+        is_valid, error_message = validate_image(uploaded_file)
+        if not is_valid:
+            st.error(error_message)
+        else:
+            extracted_text = extract_text_from_image(uploaded_file)        
+            if extracted_text:
+                st.success("Text extracted from image successfully.")
+                st.text_area("Extracted Text", extracted_text)
+
+    # Query button
+    if st.button("Submit"):
+        # Nếu cả hai user_input và extracted_text đều trống, thông báo lỗi
+        if not user_input and not extracted_text:
+            st.error("Please provide either a query or an image.")
+        else:
+            # Gọi hàm retrieve_and_generate, truyền None nếu không có text từ người dùng hoặc ảnh
+            response, references = retrieve_and_generate(user_input or None, extracted_text)
+            if response:
+                st.write("Response: ", response)
+                if references:
+                    st.write("References: ", references)
 
 if __name__ == "__main__":
     main()
